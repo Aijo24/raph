@@ -207,6 +207,16 @@ RALPH_HOME="$HOME/.ralph"
 exec "$RALPH_HOME/ralph-stats.sh" "$@"
 EOF
 
+    # Create raph-track command (token optimization tracker)
+    cat > "$INSTALL_DIR/raph-track" << 'EOF'
+#!/bin/bash
+# Raph Track - Token savings tracker for Raph
+
+RALPH_HOME="$HOME/.ralph"
+
+exec "$RALPH_HOME/raph-track.sh" "$@"
+EOF
+
     # Copy actual script files to Ralph home with modifications for global operation
     cp "$SCRIPT_DIR/ralph_monitor.sh" "$RALPH_HOME/"
 
@@ -223,6 +233,9 @@ EOF
     # Copy stats script to Ralph home (Issue #21)
     cp "$SCRIPT_DIR/ralph-stats.sh" "$RALPH_HOME/"
 
+    # Copy raph-track to Ralph home (token optimization tracker)
+    cp "$SCRIPT_DIR/raph-track.sh" "$RALPH_HOME/"
+
     # Make all commands executable
     chmod +x "$INSTALL_DIR/ralph"
     chmod +x "$INSTALL_DIR/ralph-monitor"
@@ -232,12 +245,14 @@ EOF
     chmod +x "$INSTALL_DIR/ralph-enable"
     chmod +x "$INSTALL_DIR/ralph-enable-ci"
     chmod +x "$INSTALL_DIR/ralph-stats"
+    chmod +x "$INSTALL_DIR/raph-track"
     chmod +x "$RALPH_HOME/ralph_monitor.sh"
     chmod +x "$RALPH_HOME/ralph_import.sh"
     chmod +x "$RALPH_HOME/migrate_to_ralph_folder.sh"
     chmod +x "$RALPH_HOME/ralph_enable.sh"
     chmod +x "$RALPH_HOME/ralph_enable_ci.sh"
     chmod +x "$RALPH_HOME/ralph-stats.sh"
+    chmod +x "$RALPH_HOME/raph-track.sh"
     chmod +x "$RALPH_HOME/lib/"*.sh
 
     log "SUCCESS" "Ralph scripts installed to $INSTALL_DIR"
