@@ -64,6 +64,16 @@ display_status() {
         echo -e "${CYAN}│${NC} Loop Count:     ${WHITE}#$loop_count${NC}"
         echo -e "${CYAN}│${NC} Status:         ${GREEN}$status${NC}"
         echo -e "${CYAN}│${NC} API Calls:      $calls_made/$max_calls"
+
+        # Session token tracking (token optimization)
+        local session_tokens=$(echo "$status_data" | jq -r '.session_tokens // "0"' 2>/dev/null || echo "0")
+        local compact_threshold=$(echo "$status_data" | jq -r '.session_compact_threshold // "0"' 2>/dev/null || echo "0")
+        if [[ "$compact_threshold" -gt 0 ]] 2>/dev/null; then
+            local pct=$((session_tokens * 100 / compact_threshold))
+            echo -e "${CYAN}│${NC} Session Tokens: ${WHITE}${session_tokens}${NC} / ${compact_threshold} (${pct}%)"
+        else
+            echo -e "${CYAN}│${NC} Session Tokens: ${WHITE}${session_tokens}${NC}"
+        fi
         echo -e "${CYAN}└─────────────────────────────────────────────────────────────────────────┘${NC}"
         echo
         

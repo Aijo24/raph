@@ -107,6 +107,66 @@ When a timeout occurs, Ralph checks git for changes made during the run:
 
 ---
 
+## Token Optimization Flags
+
+See the [Token Optimization Guide](TOKEN_OPTIMIZATION.md) for full details and benchmarks.
+
+### `--no-prompt-caching`
+Disable the continuation prompt optimization. When set, every loop sends the full PROMPT.md as the user message (baseline behavior).
+
+```bash
+ralph --no-prompt-caching    # Debug: verify behavior matches pre-optimization
+```
+
+| Default | `.ralphrc` key |
+|---------|----------------|
+| Caching enabled (`true`) | `PROMPT_CACHING` |
+
+---
+
+### `--session-max-loops N`
+Reset the session after N loops. This forces periodic session rotation, which acts as observation masking — old tool outputs are discarded and the new session starts with a work summary handoff.
+
+```bash
+ralph --session-max-loops 10   # Fresh session every 10 loops
+ralph --session-max-loops 5    # Aggressive masking for token-sensitive work
+```
+
+| Default | `.ralphrc` key |
+|---------|----------------|
+| `0` (disabled) | `SESSION_MAX_LOOPS` |
+
+---
+
+### `--compact-threshold N`
+Reset the session after N cumulative tokens. Prevents unbounded session growth.
+
+```bash
+ralph --compact-threshold 100000   # Compact sooner (cost-sensitive)
+ralph --compact-threshold 500000   # Compact later (context-sensitive)
+```
+
+| Default | `.ralphrc` key |
+|---------|----------------|
+| `200000` | `SESSION_COMPACT_THRESHOLD` |
+
+---
+
+### `--repo-map`
+Enable lightweight repo map generation. Ralph scans source files for function/class signatures and includes a compact map in the system prompt.
+
+```bash
+ralph --repo-map    # Include code structure overview
+```
+
+| Default | `.ralphrc` key |
+|---------|----------------|
+| `false` | `REPO_MAP` |
+
+**Related `.ralphrc` setting:** `REPO_MAP_MAX_TOKENS=1500` (max chars for the map)
+
+---
+
 ## Circuit Breaker Flags
 
 ### `--reset-circuit`

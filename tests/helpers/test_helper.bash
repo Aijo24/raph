@@ -225,3 +225,29 @@ source_ralph_functions() {
     # We'll extract functions into a separate file for testing
     :
 }
+
+# Helper: Create a mock work summary file
+create_mock_work_summary() {
+    local content=${1:-"- [Loop 1, 10:00] Implemented auth module\n- [Loop 2, 10:15] Added tests for auth"}
+    mkdir -p "$RALPH_DIR"
+    echo -e "$content" > "$RALPH_DIR/.work_summary"
+}
+
+# Helper: Create a mock session tokens file
+create_mock_session_tokens() {
+    local tokens=${1:-50000}
+    mkdir -p "$RALPH_DIR"
+    echo "$tokens" > "$RALPH_DIR/.session_tokens"
+}
+
+# Helper: Set up token optimization environment variables
+setup_token_optimization_env() {
+    export CLAUDE_PROMPT_CACHING="${1:-true}"
+    export SESSION_COMPACT_THRESHOLD="${2:-200000}"
+    export SESSION_MAX_LOOPS="${3:-0}"
+    export CLAUDE_CONTINUATION_EFFORT="${4:-}"
+    export CLAUDE_REPO_MAP="${5:-false}"
+    export CLAUDE_REPO_MAP_MAX_TOKENS="${6:-1500}"
+    export SESSION_TOKEN_FILE="$RALPH_DIR/.session_tokens"
+    export WORK_SUMMARY_FILE="$RALPH_DIR/.work_summary"
+}

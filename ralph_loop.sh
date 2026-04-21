@@ -52,6 +52,12 @@ _env_CLAUDE_EFFORT="${CLAUDE_EFFORT:-}"
 _env_RALPH_SHELL_INIT_FILE="${RALPH_SHELL_INIT_FILE:-}"
 _env_ENABLE_NOTIFICATIONS="${ENABLE_NOTIFICATIONS:-}"
 _env_ENABLE_BACKUP="${ENABLE_BACKUP:-}"
+_env_CLAUDE_PROMPT_CACHING="${CLAUDE_PROMPT_CACHING:-}"
+_env_SESSION_COMPACT_THRESHOLD="${SESSION_COMPACT_THRESHOLD:-}"
+_env_SESSION_MAX_LOOPS="${SESSION_MAX_LOOPS:-}"
+_env_CLAUDE_CONTINUATION_EFFORT="${CLAUDE_CONTINUATION_EFFORT:-}"
+_env_CLAUDE_REPO_MAP="${CLAUDE_REPO_MAP:-}"
+_env_CLAUDE_REPO_MAP_MAX_TOKENS="${CLAUDE_REPO_MAP_MAX_TOKENS:-}"
 
 # Now set defaults (only if not already set by environment)
 MAX_CALLS_PER_HOUR="${MAX_CALLS_PER_HOUR:-100}"
@@ -74,6 +80,16 @@ RALPH_SHELL_INIT_FILE="${RALPH_SHELL_INIT_FILE:-}" # Shell init file to source b
 DRY_RUN="${DRY_RUN:-false}"                      # Simulate loop without making actual Claude API calls
 ENABLE_NOTIFICATIONS="${ENABLE_NOTIFICATIONS:-false}"  # Enable desktop notifications; set true or use --notify flag
 ENABLE_BACKUP="${ENABLE_BACKUP:-false}"               # Enable automatic git backups before each loop; set true or use --backup flag
+
+# Token optimization configuration
+CLAUDE_PROMPT_CACHING="${CLAUDE_PROMPT_CACHING:-true}"           # Use short continuation prompts on loop 2+ (saves ~3K tokens/loop)
+SESSION_COMPACT_THRESHOLD="${SESSION_COMPACT_THRESHOLD:-200000}" # Reset session after N cumulative tokens (0 = disabled)
+SESSION_MAX_LOOPS="${SESSION_MAX_LOOPS:-0}"                      # Reset session after N loops (0 = disabled)
+CLAUDE_CONTINUATION_EFFORT="${CLAUDE_CONTINUATION_EFFORT:-}"     # Effort level for loop 2+ (empty = same as CLAUDE_EFFORT)
+CLAUDE_REPO_MAP="${CLAUDE_REPO_MAP:-false}"                      # Generate lightweight repo map for context
+CLAUDE_REPO_MAP_MAX_TOKENS="${CLAUDE_REPO_MAP_MAX_TOKENS:-1500}" # Max chars for repo map (~375 tokens)
+SESSION_TOKEN_FILE="$RALPH_DIR/.session_tokens"                  # Cumulative token counter for current session
+WORK_SUMMARY_FILE="$RALPH_DIR/.work_summary"                     # Rolling work summary across loops
 
 # Session management configuration (Phase 1.2)
 # Note: SESSION_EXPIRATION_SECONDS is defined in lib/response_analyzer.sh (86400 = 24 hours)
@@ -159,6 +175,19 @@ load_ralphrc() {
     if [[ -n "${RALPH_VERBOSE:-}" ]]; then
         VERBOSE_PROGRESS="$RALPH_VERBOSE"
     fi
+    # Token optimization mappings
+    if [[ -n "${PROMPT_CACHING:-}" ]]; then
+        CLAUDE_PROMPT_CACHING="$PROMPT_CACHING"
+    fi
+    if [[ -n "${CONTINUATION_EFFORT:-}" ]]; then
+        CLAUDE_CONTINUATION_EFFORT="$CONTINUATION_EFFORT"
+    fi
+    if [[ -n "${REPO_MAP:-}" ]]; then
+        CLAUDE_REPO_MAP="$REPO_MAP"
+    fi
+    if [[ -n "${REPO_MAP_MAX_TOKENS:-}" ]]; then
+        CLAUDE_REPO_MAP_MAX_TOKENS="$REPO_MAP_MAX_TOKENS"
+    fi
 
     # Restore ONLY values that were explicitly set via environment variables
     # (not script defaults). The _env_* variables were captured BEFORE defaults were set.
@@ -180,6 +209,12 @@ load_ralphrc() {
     [[ -n "$_env_RALPH_SHELL_INIT_FILE" ]] && RALPH_SHELL_INIT_FILE="$_env_RALPH_SHELL_INIT_FILE"
     [[ -n "$_env_ENABLE_NOTIFICATIONS" ]] && ENABLE_NOTIFICATIONS="$_env_ENABLE_NOTIFICATIONS"
     [[ -n "$_env_ENABLE_BACKUP" ]] && ENABLE_BACKUP="$_env_ENABLE_BACKUP"
+    [[ -n "$_env_CLAUDE_PROMPT_CACHING" ]] && CLAUDE_PROMPT_CACHING="$_env_CLAUDE_PROMPT_CACHING"
+    [[ -n "$_env_SESSION_COMPACT_THRESHOLD" ]] && SESSION_COMPACT_THRESHOLD="$_env_SESSION_COMPACT_THRESHOLD"
+    [[ -n "$_env_SESSION_MAX_LOOPS" ]] && SESSION_MAX_LOOPS="$_env_SESSION_MAX_LOOPS"
+    [[ -n "$_env_CLAUDE_CONTINUATION_EFFORT" ]] && CLAUDE_CONTINUATION_EFFORT="$_env_CLAUDE_CONTINUATION_EFFORT"
+    [[ -n "$_env_CLAUDE_REPO_MAP" ]] && CLAUDE_REPO_MAP="$_env_CLAUDE_REPO_MAP"
+    [[ -n "$_env_CLAUDE_REPO_MAP_MAX_TOKENS" ]] && CLAUDE_REPO_MAP_MAX_TOKENS="$_env_CLAUDE_REPO_MAP_MAX_TOKENS"
 
     RALPHRC_LOADED=true
     return 0
@@ -453,6 +488,8 @@ update_status() {
     
     local tokens_used
     tokens_used=$(cat "$TOKEN_COUNT_FILE" 2>/dev/null || echo "0")
+    local session_tokens
+    session_tokens=$(get_session_token_count 2>/dev/null || echo "0")
     cat > "$STATUS_FILE" << STATUSEOF
 {
     "timestamp": "$(get_iso_timestamp)",
@@ -461,6 +498,8 @@ update_status() {
     "max_calls_per_hour": $MAX_CALLS_PER_HOUR,
     "tokens_used_this_hour": $tokens_used,
     "max_tokens_per_hour": $MAX_TOKENS_PER_HOUR,
+    "session_tokens": $session_tokens,
+    "session_compact_threshold": ${SESSION_COMPACT_THRESHOLD:-0},
     "last_action": "$last_action",
     "status": "$status",
     "exit_reason": "$exit_reason",
@@ -570,9 +609,12 @@ track_metrics() {
     ts=$(get_iso_timestamp)
     local metrics_file="$LOG_DIR/metrics.jsonl"
 
+    local session_tokens
+    session_tokens=$(get_session_token_count 2>/dev/null || echo "0")
+
     mkdir -p "$LOG_DIR"
-    printf '{"timestamp":"%s","loop":%d,"duration":%d,"success":%s,"calls":%d}\n' \
-        "$ts" "$loop_num" "$duration" "$success" "$calls" >> "$metrics_file"
+    printf '{"timestamp":"%s","loop":%d,"duration":%d,"success":%s,"calls":%d,"session_tokens":%d}\n' \
+        "$ts" "$loop_num" "$duration" "$success" "$calls" "$session_tokens" >> "$metrics_file"
 }
 
 # Print a one-line metrics summary from logs/metrics.jsonl (Issue #21)
@@ -889,11 +931,18 @@ build_loop_context() {
         fi
     fi
 
-    # Add previous loop summary (truncated)
-    if [[ -f "$RESPONSE_ANALYSIS_FILE" ]]; then
-        local prev_summary=$(jq -r '.analysis.work_summary // ""' "$RESPONSE_ANALYSIS_FILE" 2>/dev/null | head -c 200)
-        if [[ -n "$prev_summary" && "$prev_summary" != "null" ]]; then
-            context+="Previous: ${prev_summary} "
+    # Add rolling work summary (richer context than single-loop summary)
+    local work_history
+    work_history=$(get_work_summary 2>/dev/null)
+    if [[ -n "$work_history" ]]; then
+        context+="Work history: ${work_history} "
+    else
+        # Fallback: use previous loop summary if no rolling summary exists yet
+        if [[ -f "$RESPONSE_ANALYSIS_FILE" ]]; then
+            local prev_summary=$(jq -r '.analysis.work_summary // ""' "$RESPONSE_ANALYSIS_FILE" 2>/dev/null | head -c 200)
+            if [[ -n "$prev_summary" && "$prev_summary" != "null" ]]; then
+                context+="Previous: ${prev_summary} "
+            fi
         fi
     fi
 
@@ -906,9 +955,352 @@ build_loop_context() {
         fi
     fi
 
-    # Limit total length to ~500 chars
-    echo "${context:0:500}"
+    # Limit total length to ~1500 chars (increased from 500 to accommodate work history)
+    echo "${context:0:1500}"
 }
+
+# =============================================================================
+# TOKEN OPTIMIZATION FUNCTIONS
+# =============================================================================
+
+# Feature 1: Rolling Work Summary
+# Append current loop's work summary to the rolling summary file
+# Keeps the file bounded to ~2000 chars (~500 tokens)
+update_work_summary() {
+    local loop_count=${1:-0}
+    local summary=""
+
+    if [[ -f "$RESPONSE_ANALYSIS_FILE" ]]; then
+        summary=$(jq -r '.analysis.work_summary // ""' "$RESPONSE_ANALYSIS_FILE" 2>/dev/null)
+    fi
+
+    if [[ -z "$summary" || "$summary" == "null" ]]; then
+        return 0
+    fi
+
+    # Append timestamped bullet point
+    local ts
+    ts=$(date '+%H:%M')
+    local entry="- [Loop ${loop_count}, ${ts}] ${summary}"
+
+    mkdir -p "$RALPH_DIR"
+
+    # Append and truncate to 2000 chars (keep most recent entries)
+    if [[ -f "$WORK_SUMMARY_FILE" ]]; then
+        # Append new entry, then keep only the last 2000 chars
+        echo "$entry" >> "$WORK_SUMMARY_FILE"
+        local content
+        content=$(tail -c 2000 "$WORK_SUMMARY_FILE")
+        echo "$content" > "$WORK_SUMMARY_FILE"
+    else
+        echo "$entry" > "$WORK_SUMMARY_FILE"
+    fi
+}
+
+# Get the rolling work summary content
+get_work_summary() {
+    if [[ -f "$WORK_SUMMARY_FILE" ]]; then
+        cat "$WORK_SUMMARY_FILE" 2>/dev/null | tail -c 500
+    fi
+}
+
+# Feature 2: Session Size Monitoring
+# Track cumulative tokens for the current session (distinct from hourly counter)
+update_session_token_count() {
+    local output_file=$1
+    local new_tokens
+    new_tokens=$(extract_token_usage "$output_file")
+
+    if [[ "$new_tokens" -gt 0 ]] 2>/dev/null; then
+        local current
+        current=$(cat "$SESSION_TOKEN_FILE" 2>/dev/null || echo "0")
+        local total=$((current + new_tokens))
+        echo "$total" > "$SESSION_TOKEN_FILE"
+        log_session_token_warnings "$total"
+        if [[ "${VERBOSE_PROGRESS:-}" == "true" ]]; then
+            log_status "INFO" "Session tokens: ${total}${SESSION_COMPACT_THRESHOLD:+/$SESSION_COMPACT_THRESHOLD} (+${new_tokens})"
+        fi
+    fi
+}
+
+# Get current session token count
+get_session_token_count() {
+    cat "$SESSION_TOKEN_FILE" 2>/dev/null || echo "0"
+}
+
+# Log warnings when session tokens approach compaction threshold
+log_session_token_warnings() {
+    local session_tokens=$1
+    local threshold="${SESSION_COMPACT_THRESHOLD:-0}"
+
+    [[ "$threshold" -le 0 ]] 2>/dev/null && return 0
+
+    local pct=$((session_tokens * 100 / threshold))
+    local warning_file="$RALPH_DIR/.session_token_warnings"
+    local last_pct
+    last_pct=$(cat "$warning_file" 2>/dev/null || echo "0")
+
+    if [[ $pct -ge 90 && $last_pct -lt 90 ]]; then
+        log_status "WARN" "⚠️  Session tokens at ${pct}% of threshold (${session_tokens}/${threshold}). Compaction imminent."
+        echo "90" > "$warning_file"
+    elif [[ $pct -ge 75 && $last_pct -lt 75 ]]; then
+        log_status "WARN" "Session tokens at ${pct}% of threshold (${session_tokens}/${threshold})"
+        echo "75" > "$warning_file"
+    elif [[ $pct -ge 50 && $last_pct -lt 50 ]]; then
+        log_status "INFO" "Session tokens at ${pct}% of threshold (${session_tokens}/${threshold})"
+        echo "50" > "$warning_file"
+    fi
+}
+
+# Feature 3: Session Compaction / Periodic Reset
+# Check if the current session should be compacted (reset with continuity)
+# Returns 0 if compaction needed, 1 otherwise
+should_compact_session() {
+    local loop_count=${1:-0}
+
+    # Check token threshold
+    if [[ "${SESSION_COMPACT_THRESHOLD:-0}" -gt 0 ]] 2>/dev/null; then
+        local session_tokens
+        session_tokens=$(get_session_token_count)
+        if [[ "$session_tokens" -ge "$SESSION_COMPACT_THRESHOLD" ]]; then
+            return 0
+        fi
+    fi
+
+    # Check loop count threshold
+    if [[ "${SESSION_MAX_LOOPS:-0}" -gt 0 ]] 2>/dev/null; then
+        local session_loop_count=0
+        if [[ -f "$RALPH_SESSION_FILE" ]]; then
+            session_loop_count=$(jq -r '.session_loop_count // 0' "$RALPH_SESSION_FILE" 2>/dev/null || echo "0")
+        fi
+        if [[ "$session_loop_count" -ge "$SESSION_MAX_LOOPS" ]]; then
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+# Compact session: reset with continuity via work summary handoff
+compact_session() {
+    local loop_count=${1:-0}
+    local reason="compaction"
+
+    local session_tokens
+    session_tokens=$(get_session_token_count)
+    local session_loop_count=0
+    if [[ -f "$RALPH_SESSION_FILE" ]]; then
+        session_loop_count=$(jq -r '.session_loop_count // 0' "$RALPH_SESSION_FILE" 2>/dev/null || echo "0")
+    fi
+
+    if [[ "${SESSION_COMPACT_THRESHOLD:-0}" -gt 0 ]] 2>/dev/null && [[ "$session_tokens" -ge "$SESSION_COMPACT_THRESHOLD" ]]; then
+        reason="token_threshold_compaction"
+        log_status "INFO" "🔄 Session compaction triggered: tokens ${session_tokens} >= threshold ${SESSION_COMPACT_THRESHOLD}"
+    elif [[ "${SESSION_MAX_LOOPS:-0}" -gt 0 ]] 2>/dev/null && [[ "$session_loop_count" -ge "$SESSION_MAX_LOOPS" ]]; then
+        reason="loop_count_compaction"
+        log_status "INFO" "🔄 Session compaction triggered: loops ${session_loop_count} >= max ${SESSION_MAX_LOOPS}"
+    fi
+
+    # Reset session (preserves .work_summary for continuity)
+    reset_session "$reason"
+
+    # Reset session token counter and warnings
+    echo "0" > "$SESSION_TOKEN_FILE"
+    rm -f "$RALPH_DIR/.session_token_warnings" 2>/dev/null
+
+    log_status "INFO" "Session compacted after ${session_loop_count} loops, ${session_tokens} tokens. Starting fresh with work summary."
+}
+
+# Build a rich handoff prompt for the first loop of a new session after compaction
+build_session_handoff_prompt() {
+    local prompt=""
+
+    # Include rolling work summary
+    local work_history
+    work_history=$(get_work_summary 2>/dev/null)
+    if [[ -n "$work_history" ]]; then
+        prompt+="## Work Completed So Far\n${work_history}\n\n"
+    fi
+
+    # Include fix_plan status
+    if [[ -f "$RALPH_DIR/fix_plan.md" ]]; then
+        local incomplete
+        incomplete=$(grep -cE "^[[:space:]]*- \[ \]" "$RALPH_DIR/fix_plan.md" 2>/dev/null || echo "0")
+        local completed
+        completed=$(grep -cE "^[[:space:]]*- \[x\]" "$RALPH_DIR/fix_plan.md" 2>/dev/null || echo "0")
+        prompt+="## Fix Plan Status\nCompleted: ${completed}, Remaining: ${incomplete}\n\n"
+    fi
+
+    # Include last recommendation
+    if [[ -f "$RESPONSE_ANALYSIS_FILE" ]]; then
+        local recommendation
+        recommendation=$(jq -r '.analysis.work_summary // ""' "$RESPONSE_ANALYSIS_FILE" 2>/dev/null)
+        if [[ -n "$recommendation" && "$recommendation" != "null" ]]; then
+            prompt+="## Last Loop Recommendation\n${recommendation}\n"
+        fi
+    fi
+
+    echo -e "$prompt"
+}
+
+# Feature 4: Prompt Caching Optimization
+# Generate a short continuation prompt for loop 2+ (~200 tokens instead of ~3K)
+generate_continuation_prompt() {
+    local loop_count=$1
+    local prompt=""
+
+    prompt+="Continue working on the project. This is loop #${loop_count}.\n\n"
+
+    # Include active (incomplete) fix plan items directly (Feature 6)
+    local active_items
+    active_items=$(generate_active_fix_plan 2>/dev/null)
+    if [[ -n "$active_items" ]]; then
+        prompt+="## Remaining Tasks\n${active_items}\n\n"
+    fi
+
+    # Include work summary
+    local work_history
+    work_history=$(get_work_summary 2>/dev/null)
+    if [[ -n "$work_history" ]]; then
+        prompt+="## Recent Work\n${work_history}\n\n"
+    fi
+
+    # Include corrective guidance if previous loop asked questions
+    if [[ -f "$RESPONSE_ANALYSIS_FILE" ]]; then
+        local prev_asking_questions
+        prev_asking_questions=$(jq -r '.analysis.asking_questions // false' "$RESPONSE_ANALYSIS_FILE" 2>/dev/null || echo "false")
+        if [[ "$prev_asking_questions" == "true" ]]; then
+            prompt+="IMPORTANT: You asked questions in the previous loop. This is a headless automation loop. Do NOT ask questions. Proceed autonomously.\n\n"
+        fi
+    fi
+
+    prompt+="Follow .ralph/fix_plan.md and choose the most important remaining item to implement. Remember to include the RALPH_STATUS block at the end of your response."
+
+    echo -e "$prompt"
+}
+
+# Return PROMPT.md content for use as system prompt (static, cacheable by Anthropic)
+build_static_system_prompt() {
+    local prompt_file=${1:-$PROMPT_FILE}
+    local content=""
+
+    if [[ -f "$prompt_file" ]]; then
+        content=$(cat "$prompt_file")
+    fi
+
+    # Append repo map if enabled (Feature 8)
+    if [[ "$CLAUDE_REPO_MAP" == "true" ]]; then
+        local repo_map
+        repo_map=$(get_repo_map_if_changed 2>/dev/null)
+        if [[ -n "$repo_map" ]]; then
+            content+="\n\n## Project Structure (Auto-Generated)\n${repo_map}"
+        fi
+    fi
+
+    echo "$content"
+}
+
+# Feature 6: Generate filtered fix plan with only incomplete items
+# Returns the filtered content (does not write to file)
+generate_active_fix_plan() {
+    if [[ ! -f "$RALPH_DIR/fix_plan.md" ]]; then
+        return 0
+    fi
+
+    # Keep section headers (## lines) and uncompleted items (- [ ])
+    # Filter out completed items (- [x])
+    grep -E "^(#|[[:space:]]*- \[ \])" "$RALPH_DIR/fix_plan.md" 2>/dev/null | head -30
+}
+
+# Feature 8: Lightweight Repo Map
+# Generate a compact code map showing function/class signatures
+generate_repo_map() {
+    local max_chars="${CLAUDE_REPO_MAP_MAX_TOKENS:-1500}"
+    local map=""
+
+    # Detect which source directories exist
+    local search_dirs=()
+    for dir in src lib app components pages; do
+        [[ -d "$dir" ]] && search_dirs+=("$dir")
+    done
+
+    # Fallback to current directory if no standard dirs found
+    if [[ ${#search_dirs[@]} -eq 0 ]]; then
+        search_dirs=(".")
+    fi
+
+    # JS/TS signatures
+    local js_sigs
+    js_sigs=$(grep -rn 'export\s\+\(function\|class\|const\|interface\|type\)\s' --include='*.js' --include='*.ts' --include='*.tsx' "${search_dirs[@]}" 2>/dev/null | head -40)
+    if [[ -n "$js_sigs" ]]; then
+        map+="### JS/TS\n${js_sigs}\n\n"
+    fi
+
+    # Python signatures
+    local py_sigs
+    py_sigs=$(grep -rn '^\(def\|class\)\s' --include='*.py' "${search_dirs[@]}" 2>/dev/null | head -40)
+    if [[ -n "$py_sigs" ]]; then
+        map+="### Python\n${py_sigs}\n\n"
+    fi
+
+    # Bash function signatures
+    local sh_sigs
+    sh_sigs=$(grep -rn '^[a-zA-Z_][a-zA-Z_0-9]*()' --include='*.sh' "${search_dirs[@]}" 2>/dev/null | head -40)
+    if [[ -n "$sh_sigs" ]]; then
+        map+="### Bash\n${sh_sigs}\n\n"
+    fi
+
+    # Go signatures
+    local go_sigs
+    go_sigs=$(grep -rn '^func\s' --include='*.go' "${search_dirs[@]}" 2>/dev/null | head -40)
+    if [[ -n "$go_sigs" ]]; then
+        map+="### Go\n${go_sigs}\n\n"
+    fi
+
+    # Rust signatures
+    local rs_sigs
+    rs_sigs=$(grep -rn '^\(pub\s\+\)\?\(fn\|struct\|enum\|trait\|impl\)\s' --include='*.rs' "${search_dirs[@]}" 2>/dev/null | head -40)
+    if [[ -n "$rs_sigs" ]]; then
+        map+="### Rust\n${rs_sigs}\n\n"
+    fi
+
+    if [[ -z "$map" ]]; then
+        return 0
+    fi
+
+    # Truncate to max chars
+    echo -e "$map" | head -c "$max_chars"
+}
+
+# Get repo map, regenerating only if source files changed
+get_repo_map_if_changed() {
+    local checksum_file="$RALPH_DIR/.repo_map_checksum"
+    local map_file="$RALPH_DIR/.repo_map"
+
+    # Compute fast checksum of source file listing (names + sizes)
+    local current_checksum
+    current_checksum=$(find . -maxdepth 4 -type f \( -name '*.js' -o -name '*.ts' -o -name '*.tsx' -o -name '*.py' -o -name '*.sh' -o -name '*.go' -o -name '*.rs' \) ! -path '*/node_modules/*' ! -path '*/.git/*' -exec stat -f '%N%z' {} \; 2>/dev/null | sort | md5 2>/dev/null || echo "unknown")
+
+    local cached_checksum
+    cached_checksum=$(cat "$checksum_file" 2>/dev/null || echo "")
+
+    if [[ "$current_checksum" == "$cached_checksum" && -f "$map_file" ]]; then
+        cat "$map_file"
+    else
+        local new_map
+        new_map=$(generate_repo_map)
+        if [[ -n "$new_map" ]]; then
+            mkdir -p "$RALPH_DIR"
+            echo "$new_map" > "$map_file"
+            echo "$current_checksum" > "$checksum_file"
+            echo "$new_map"
+        fi
+    fi
+}
+
+# =============================================================================
+# END TOKEN OPTIMIZATION FUNCTIONS
+# =============================================================================
 
 # Get session file age in hours (cross-platform)
 # Returns: age in hours on stdout, or -1 if stat fails
@@ -1091,6 +1483,10 @@ reset_session() {
     # Clear response analysis to prevent stale EXIT_SIGNAL from previous session
     rm -f "$RESPONSE_ANALYSIS_FILE" 2>/dev/null
 
+    # Reset session token counter and warnings (token optimization)
+    echo "0" > "$SESSION_TOKEN_FILE" 2>/dev/null
+    rm -f "$RALPH_DIR/.session_token_warnings" 2>/dev/null
+
     # Log the session transition
     log_session_transition "active" "reset" "$reason" "${loop_count:-0}"
 
@@ -1181,7 +1577,8 @@ init_session_tracking() {
                 created_at: $created_at,
                 last_used: $last_used,
                 reset_at: $reset_at,
-                reset_reason: $reset_reason
+                reset_reason: $reset_reason,
+                session_loop_count: 0
             }' > "$RALPH_SESSION_FILE"
 
         log_status "INFO" "Initialized session tracking (session: $new_session_id)"
@@ -1205,7 +1602,8 @@ init_session_tracking() {
                 created_at: $created_at,
                 last_used: $last_used,
                 reset_at: $reset_at,
-                reset_reason: $reset_reason
+                reset_reason: $reset_reason,
+                session_loop_count: 0
             }' > "$RALPH_SESSION_FILE"
     fi
 }
@@ -1219,9 +1617,9 @@ update_session_last_used() {
     local ts
     ts=$(get_iso_timestamp)
 
-    # Update last_used in existing session file
+    # Update last_used and increment session_loop_count in existing session file
     local updated
-    updated=$(jq --arg last_used "$ts" '.last_used = $last_used' "$RALPH_SESSION_FILE" 2>/dev/null)
+    updated=$(jq --arg last_used "$ts" '.last_used = $last_used | .session_loop_count = ((.session_loop_count // 0) + 1)' "$RALPH_SESSION_FILE" 2>/dev/null)
     local jq_status=$?
 
     if [[ $jq_status -eq 0 && -n "$updated" ]]; then
@@ -1235,10 +1633,13 @@ declare -a CLAUDE_CMD_ARGS=()
 # Build Claude CLI command with modern flags using array (shell-injection safe)
 # Populates global CLAUDE_CMD_ARGS array for direct execution
 # Uses -p flag with prompt content (Claude CLI does not have --prompt-file)
+# Token optimization: on loop 2+ with prompt caching, uses short continuation prompt
+# and moves static instructions to --append-system-prompt for Anthropic cache hits
 build_claude_command() {
     local prompt_file=$1
     local loop_context=$2
     local session_id=$3
+    local loop_count=${4:-1}
 
     # Reset global array
     # Note: We do NOT use --dangerously-skip-permissions here. Tool permissions
@@ -1257,9 +1658,13 @@ build_claude_command() {
         CLAUDE_CMD_ARGS+=("--model" "$CLAUDE_MODEL")
     fi
 
-    # Add effort level override (Issue #228)
-    if [[ -n "${CLAUDE_EFFORT:-}" ]]; then
-        CLAUDE_CMD_ARGS+=("--effort" "$CLAUDE_EFFORT")
+    # Determine effort level (Feature 5: continuation effort)
+    local effective_effort="${CLAUDE_EFFORT:-}"
+    if [[ $loop_count -gt 1 && -n "${CLAUDE_CONTINUATION_EFFORT:-}" ]]; then
+        effective_effort="$CLAUDE_CONTINUATION_EFFORT"
+    fi
+    if [[ -n "$effective_effort" ]]; then
+        CLAUDE_CMD_ARGS+=("--effort" "$effective_effort")
     fi
 
     # Add output format flag
@@ -1293,17 +1698,58 @@ build_claude_command() {
     # If no session_id, start fresh - Claude will generate a new session ID
     # which we'll capture via save_claude_session() for future loops
 
-    # Add loop context as system prompt (no escaping needed - array handles it)
-    if [[ -n "$loop_context" ]]; then
-        CLAUDE_CMD_ARGS+=("--append-system-prompt" "$loop_context")
+    # Token optimization: Prompt caching strategy
+    # Loop 1 (or no session): Send full PROMPT.md via -p (establishes instructions)
+    # Loop 2+: Move static PROMPT.md to --append-system-prompt (Anthropic caches prefix at 90% discount)
+    #          Send only short continuation prompt via -p (~200 tokens vs ~3K)
+    local use_continuation=false
+    if [[ "$CLAUDE_PROMPT_CACHING" == "true" && $loop_count -gt 1 && -n "$session_id" ]]; then
+        use_continuation=true
     fi
 
-    # Read prompt file content and use -p flag
-    # Note: Claude CLI uses -p for prompts, not --prompt-file (which doesn't exist)
-    # Array-based approach maintains shell injection safety
-    local prompt_content
-    prompt_content=$(cat "$prompt_file")
-    CLAUDE_CMD_ARGS+=("-p" "$prompt_content")
+    if [[ "$use_continuation" == "true" ]]; then
+        # Build system prompt: static PROMPT.md content (cacheable) + dynamic loop context
+        local static_prompt
+        static_prompt=$(build_static_system_prompt "$prompt_file")
+        local system_content="${static_prompt}"
+        if [[ -n "$loop_context" ]]; then
+            system_content+=$'\n\n'"${loop_context}"
+        fi
+        CLAUDE_CMD_ARGS+=("--append-system-prompt" "$system_content")
+
+        # Short continuation prompt as user message
+        local continuation
+        continuation=$(generate_continuation_prompt "$loop_count")
+        CLAUDE_CMD_ARGS+=("-p" "$continuation")
+
+        if [[ "${VERBOSE_PROGRESS:-}" == "true" ]]; then
+            log_status "INFO" "Using continuation prompt (loop $loop_count, ~${#continuation} chars vs ~$(wc -c < "$prompt_file") full)"
+        fi
+    else
+        # Standard behavior: loop context in system prompt, full PROMPT.md in user message
+        local system_content=""
+        if [[ -n "$loop_context" ]]; then
+            system_content="$loop_context"
+        fi
+
+        # On first loop of a new session after compaction, include handoff context
+        local handoff
+        handoff=$(build_session_handoff_prompt 2>/dev/null)
+        if [[ -n "$handoff" && $loop_count -gt 1 ]]; then
+            system_content+=$'\n\n'"${handoff}"
+        fi
+
+        if [[ -n "$system_content" ]]; then
+            CLAUDE_CMD_ARGS+=("--append-system-prompt" "$system_content")
+        fi
+
+        # Read prompt file content and use -p flag
+        # Note: Claude CLI uses -p for prompts, not --prompt-file (which doesn't exist)
+        # Array-based approach maintains shell injection safety
+        local prompt_content
+        prompt_content=$(cat "$prompt_file")
+        CLAUDE_CMD_ARGS+=("-p" "$prompt_content")
+    fi
 }
 
 # create_backup - Create a git backup branch before a loop iteration (Issue #23)
@@ -1451,6 +1897,11 @@ execute_claude_code() {
         log_status "INFO" "Loop context: $loop_context"
     fi
 
+    # Check if session needs compaction before resuming (token optimization)
+    if should_compact_session "$loop_count"; then
+        compact_session "$loop_count"
+    fi
+
     # Initialize or resume session
     local session_id=""
     if [[ "$CLAUDE_USE_CONTINUE" == "true" ]]; then
@@ -1466,7 +1917,7 @@ execute_claude_code() {
     # Build the Claude CLI command with modern flags
     local use_modern_cli=false
 
-    if build_claude_command "$PROMPT_FILE" "$loop_context" "$session_id"; then
+    if build_claude_command "$PROMPT_FILE" "$loop_context" "$session_id" "$loop_count"; then
         use_modern_cli=true
         log_status "INFO" "Using modern CLI mode (${CLAUDE_OUTPUT_FORMAT} output)"
     else
@@ -1788,6 +2239,9 @@ EOF
         # Accumulate token usage for hourly limit tracking (Issue #223)
         update_token_count "$output_file"
 
+        # Accumulate session token usage for compaction tracking
+        update_session_token_count "$output_file"
+
         # Analyze the response
         log_status "INFO" "🔍 Analyzing Claude Code response..."
         analyze_response "$output_file" "$loop_count"
@@ -1796,6 +2250,9 @@ EOF
         if [[ $analysis_exit_code -eq 0 ]]; then
             # Update exit signals based on analysis
             update_exit_signals
+
+            # Update rolling work summary (token optimization)
+            update_work_summary "$loop_count"
 
             # Log analysis summary
             log_analysis_summary
@@ -2337,6 +2794,12 @@ Modern CLI Options (Phase 1.1):
     --no-continue           Disable session continuity across loops
     --session-expiry HOURS  Set session expiration time in hours (default: $CLAUDE_SESSION_EXPIRY_HOURS)
 
+Token Optimization Options:
+    --no-prompt-caching     Disable continuation prompt optimization (send full prompt every loop)
+    --session-max-loops N   Reset session after N loops for observation masking (default: 0=disabled)
+    --compact-threshold N   Reset session after N cumulative tokens (default: $SESSION_COMPACT_THRESHOLD)
+    --repo-map              Enable lightweight repo map generation for context
+
 Files created:
     - $LOG_DIR/: All execution logs
     - $DOCS_DIR/: Generated documentation
@@ -2469,6 +2932,30 @@ while [[ $# -gt 0 ]]; do
             ;;
         --dry-run)
             DRY_RUN=true
+            shift
+            ;;
+        --no-prompt-caching)
+            CLAUDE_PROMPT_CACHING=false
+            shift
+            ;;
+        --session-max-loops)
+            if [[ -z "$2" || ! "$2" =~ ^[0-9]+$ ]]; then
+                echo "Error: --session-max-loops requires a non-negative integer"
+                exit 1
+            fi
+            SESSION_MAX_LOOPS="$2"
+            shift 2
+            ;;
+        --compact-threshold)
+            if [[ -z "$2" || ! "$2" =~ ^[0-9]+$ ]]; then
+                echo "Error: --compact-threshold requires a non-negative integer"
+                exit 1
+            fi
+            SESSION_COMPACT_THRESHOLD="$2"
+            shift 2
+            ;;
+        --repo-map)
+            CLAUDE_REPO_MAP=true
             shift
             ;;
         -n|--notify)

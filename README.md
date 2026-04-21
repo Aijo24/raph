@@ -523,6 +523,40 @@ tail -f .ralph/live.log  # Watch in another terminal
 
 Live streaming mode shows Claude Code's output in real-time as it works, providing visibility into what's happening during each loop iteration.
 
+### Token Optimization
+
+Ralph automatically reduces token consumption by up to **78%** across loop iterations while maintaining full output quality. See the [Token Optimization Guide](docs/TOKEN_OPTIMIZATION.md) for detailed benchmarks and configuration.
+
+**Quick overview — what happens automatically:**
+- **Loop 1**: Full PROMPT.md sent as user message (~2,170 tokens)
+- **Loop 2+**: Short continuation prompt (~284 tokens) + PROMPT.md cached in system prompt (90% cost discount)
+- **Session compaction**: Auto-resets session when cumulative tokens exceed 200K threshold
+- **Work summary**: Rolling history of completed work (bounded, survives resets)
+- **Active fix plan**: Only uncompleted tasks sent to Claude (completed items filtered out)
+
+**Optional extras:**
+```bash
+# In .ralphrc
+CONTINUATION_EFFORT=low          # Use lower effort on loop 2+ (saves 30-50%)
+REPO_MAP=true                    # Lightweight code map for context (saves tool calls)
+SESSION_MAX_LOOPS=10             # Reset session every 10 loops (observation masking)
+SESSION_COMPACT_THRESHOLD=100000 # Lower threshold for cost-sensitive runs
+```
+
+```bash
+# CLI flags
+ralph --no-prompt-caching        # Disable (send full prompt every loop)
+ralph --session-max-loops 10     # Reset every 10 loops
+ralph --compact-threshold 100000 # Custom token threshold
+ralph --repo-map                 # Enable repo map
+```
+
+| Metric | Before | After |
+|--------|--------|-------|
+| User prompt per loop (2+) | 2,167 tokens | 284 tokens (**-86%**) |
+| 10-loop cumulative | 21,677 tokens | 4,728 tokens (**-78%**) |
+| Optimization overhead | — | 120ms/loop (**< 0.4%**) |
+
 ### Session Continuity
 
 Ralph maintains session context across loop iterations for improved coherence:
@@ -646,7 +680,7 @@ If you want to run the test suite:
 # Install BATS testing framework
 npm install -g bats bats-support bats-assert
 
-# Run all tests (566 tests)
+# Run all tests (618 tests)
 npm test
 
 # Run specific test suites
@@ -661,6 +695,11 @@ bats tests/unit/test_task_sources.bats
 bats tests/unit/test_ralph_enable.bats
 bats tests/unit/test_wizard_utils.bats
 bats tests/unit/test_circuit_breaker_recovery.bats
+bats tests/unit/test_token_optimization.bats
+bats tests/unit/test_session_compaction.bats
+bats tests/unit/test_token_savings.bats
+bats tests/unit/test_performance.bats
+bats tests/unit/test_quality_parity.bats
 bats tests/integration/test_loop_execution.bats
 bats tests/integration/test_prd_import.bats
 bats tests/integration/test_project_setup.bats
@@ -672,10 +711,10 @@ bats tests/integration/test_installation.bats
 ```
 
 Current test status:
-- **566 tests** across 18 test files
-- **100% pass rate** (556/556 passing)
+- **618 tests** across 23 test files
+- **100% pass rate**
 - Comprehensive unit and integration tests
-- Specialized tests for JSON parsing, CLI flags, circuit breaker, EXIT_SIGNAL behavior, enable wizard, and installation workflows
+- Specialized tests for JSON parsing, CLI flags, circuit breaker, EXIT_SIGNAL behavior, enable wizard, installation workflows, token optimization, performance benchmarks, and quality parity
 
 > **Note on Coverage**: Bash code coverage measurement with kcov has fundamental limitations when tracing subprocess executions. Test pass rate (100%) is the quality gate. See [bats-core#15](https://github.com/bats-core/bats-core/issues/15) for details.
 
@@ -840,6 +879,10 @@ ralph [OPTIONS]
   --reset-session         Reset session state manually
   -b, --backup            Enable automatic git backup branch before each loop (requires git)
   --rollback [BRANCH]     Roll back to a backup branch (lists available branches if none given)
+  --no-prompt-caching     Disable continuation prompt optimization
+  --session-max-loops N   Reset session every N loops (observation masking, default: 0=disabled)
+  --compact-threshold N   Reset session after N cumulative tokens (default: 200000)
+  --repo-map              Enable lightweight repo map generation for context
 ```
 
 ### Project Commands (Per Project)

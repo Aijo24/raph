@@ -165,6 +165,12 @@ ralph --auto-reset-circuit   # Auto-reset OPEN state on startup
 # Session management
 ralph --reset-session    # Reset session state manually
 
+# Token optimization
+ralph --no-prompt-caching        # Disable continuation prompt (send full prompt every loop)
+ralph --session-max-loops 10     # Reset session every 10 loops (observation masking)
+ralph --compact-threshold 100000 # Reset session after 100K cumulative tokens
+ralph --repo-map                 # Enable lightweight repo map for context
+
 # Backup and rollback (requires git; Issue #23)
 ralph --backup           # Enable automatic backup before each loop
 ralph -b                 # Short form of --backup
@@ -204,6 +210,8 @@ bats tests/unit/test_ralph_enable.bats
 bats tests/unit/test_circuit_breaker_recovery.bats
 bats tests/unit/test_file_protection.bats
 bats tests/unit/test_integrity_check.bats
+bats tests/unit/test_token_optimization.bats
+bats tests/unit/test_session_compaction.bats
 ```
 
 ## Ralph Loop Configuration
@@ -281,6 +289,54 @@ Each loop iteration injects context via `build_loop_context()`:
 - Sessions are preserved in `.ralph/.claude_session_id`
 - Use `--continue` flag to maintain context across loops
 - Disable with `--no-continue` for isolated iterations
+
+### Token Optimization
+
+Ralph implements multiple strategies to reduce token consumption across loop iterations:
+
+**Prompt Caching (default: enabled)**
+- Loop 1: Sends full PROMPT.md via `-p` (establishes instructions)
+- Loop 2+: Moves static PROMPT.md to `--append-system-prompt` (Anthropic caches system prompt prefix at 90% discount) and sends a short continuation prompt (~200 tokens vs ~3K) via `-p`
+- Continuation prompt includes: active fix_plan items, rolling work summary, corrective guidance
+- Disable with `--no-prompt-caching` or `PROMPT_CACHING=false` in `.ralphrc`
+
+**Session Compaction**
+- Tracks cumulative session tokens in `.ralph/.session_tokens`
+- Resets session when tokens exceed `SESSION_COMPACT_THRESHOLD` (default: 200000) or loops exceed `SESSION_MAX_LOOPS` (default: 0 = disabled)
+- On compaction: session is reset, work summary is preserved for continuity, handoff context is generated
+- Session tokens displayed in `ralph-monitor` dashboard and `status.json`
+
+**Rolling Work Summary**
+- `.ralph/.work_summary` accumulates timestamped bullet points of work done across loops
+- Truncated to ~2000 chars (~500 tokens) to stay bounded
+- Survives session resets for continuity across compaction events
+- Included in loop context and continuation prompts
+
+**Continuation Effort Level**
+- `CLAUDE_CONTINUATION_EFFORT` allows using a different effort level (e.g., `low`) for loop 2+
+- Loop 1 always uses `CLAUDE_EFFORT` for initial planning/setup
+- Set in `.ralphrc` as `CONTINUATION_EFFORT=low`
+
+**Active Fix Plan Filtering**
+- Continuation prompts include only uncompleted `- [ ]` items from `fix_plan.md`
+- Eliminates Claude needing to Read and parse the full file on continuation loops
+
+**Lightweight Repo Map**
+- When `CLAUDE_REPO_MAP=true`, generates a compact code map of function/class signatures
+- Supports JS/TS, Python, bash, Go, Rust
+- Included in the system prompt (cacheable prefix)
+- Regenerated only when source files change (cached via checksum)
+- Max size: `CLAUDE_REPO_MAP_MAX_TOKENS` (default: 1500 chars, ~375 tokens)
+
+**Token Optimization Configuration Variables:**
+```bash
+CLAUDE_PROMPT_CACHING="${CLAUDE_PROMPT_CACHING:-true}"           # Continuation prompts on loop 2+
+SESSION_COMPACT_THRESHOLD="${SESSION_COMPACT_THRESHOLD:-200000}" # Reset session after N tokens
+SESSION_MAX_LOOPS="${SESSION_MAX_LOOPS:-0}"                      # Reset session after N loops (0=disabled)
+CLAUDE_CONTINUATION_EFFORT="${CLAUDE_CONTINUATION_EFFORT:-}"     # Effort for loop 2+ (empty=same)
+CLAUDE_REPO_MAP="${CLAUDE_REPO_MAP:-false}"                      # Lightweight repo map
+CLAUDE_REPO_MAP_MAX_TOKENS="${CLAUDE_REPO_MAP_MAX_TOKENS:-1500}" # Max chars for repo map
+```
 
 ### Intelligent Exit Detection
 The loop uses a dual-condition check to prevent premature exits during productive iterations:
@@ -585,7 +641,7 @@ Ralph uses a multi-layered strategy to prevent Claude from accidentally deleting
 
 ## Test Suite
 
-### Test Files (483 unit tests + integration; see `npm test` for current count)
+### Test Files (535 unit tests + integration; see `npm test` for current count)
 
 | File | Tests | Description |
 |------|-------|-------------|
@@ -608,6 +664,8 @@ Ralph uses a multi-layered strategy to prevent Claude from accidentally deleting
 | `test_file_protection.bats` | 15 | File integrity validation (RALPH_REQUIRED_PATHS, validate_ralph_integrity, get_integrity_report) (Issue #149) |
 | `test_integrity_check.bats` | 10 | Pre-loop integrity check in ralph_loop.sh (startup + in-loop validation) (Issue #149) |
 | `test_log_rotation.bats` | 5 | Log rotation (rotate_logs in lib/log_utils.sh): threshold, shift order, content assertions, missing file, stat fallback (Issue #18) |
+| `test_token_optimization.bats` | 32 | Token optimization: rolling work summary, prompt caching, continuation prompts, effort levels, active fix plan, repo map, build_claude_command integration |
+| `test_session_compaction.bats` | 20 | Session compaction: token tracking, threshold warnings, compaction triggers, session handoff, work summary preservation |
 | `test_metrics_tracking.bats` | 4 | Metrics tracking: track_metrics() JSON Lines format, per-loop append, ralph-stats output, print_metrics_summary (Issue #21) |
 | `test_notifications.bats` | 5 | Desktop notifications: send_notification() cross-platform (macOS/Linux/bell), disabled by default, --notify flag (Issue #22) |
 | `test_backup_rollback.bats` | 6 | Backup/rollback: create_backup() branch naming, disabled by default, graceful git-less handling, commit message, --backup flag, rollback_to_backup() checkout (Issue #23) |

@@ -87,6 +87,38 @@ CB_COOLDOWN_MINUTES=30
 CB_AUTO_RESET=false
 
 # =============================================================================
+# TOKEN OPTIMIZATION
+# =============================================================================
+
+# Use short continuation prompts on loop 2+ (saves ~3K tokens/loop)
+# When true, only the first loop sends the full PROMPT.md; subsequent loops
+# send a compact continuation prompt and move static instructions to the
+# system prompt (which Anthropic caches at 90% discount).
+PROMPT_CACHING=true
+
+# Reset session after N cumulative tokens (0 = disabled)
+# When the session's total token usage exceeds this threshold, Ralph resets
+# the session and starts fresh with a work summary for continuity.
+SESSION_COMPACT_THRESHOLD=200000
+
+# Reset session after N loops (0 = disabled)
+# Forces periodic session rotation to prevent unbounded context growth.
+# Recommended: 10 for token-sensitive workflows, 0 for maximum context retention.
+SESSION_MAX_LOOPS=0
+
+# Effort level for continuation loops (loop 2+)
+# Leave empty to use the same effort as the primary CLAUDE_EFFORT.
+# Set to "low" or "medium" to reduce cost on simpler follow-up iterations.
+# CONTINUATION_EFFORT=
+
+# Generate a lightweight repo map showing function/class signatures
+# Helps Claude understand the project structure without reading every file.
+# REPO_MAP=false
+
+# Maximum characters for the repo map (~4 chars per token)
+# REPO_MAP_MAX_TOKENS=1500
+
+# =============================================================================
 # ADVANCED SETTINGS
 # =============================================================================
 
