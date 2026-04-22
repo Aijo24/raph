@@ -82,8 +82,8 @@ ENABLE_NOTIFICATIONS="${ENABLE_NOTIFICATIONS:-false}"  # Enable desktop notifica
 ENABLE_BACKUP="${ENABLE_BACKUP:-false}"               # Enable automatic git backups before each loop; set true or use --backup flag
 
 # Token optimization configuration
-CLAUDE_PROMPT_CACHING="${CLAUDE_PROMPT_CACHING:-true}"           # Use short continuation prompts on loop 2+ (saves ~3K tokens/loop)
-SESSION_COMPACT_THRESHOLD="${SESSION_COMPACT_THRESHOLD:-200000}" # Reset session after N cumulative tokens (0 = disabled)
+CLAUDE_PROMPT_CACHING="${CLAUDE_PROMPT_CACHING:-true}"           # Don't re-send PROMPT.md on loop 2+ (already in session). Send rich context instead.
+SESSION_COMPACT_THRESHOLD="${SESSION_COMPACT_THRESHOLD:-800000}" # Reset session near context limit (0 = disabled). Use the 1M window aggressively.
 SESSION_MAX_LOOPS="${SESSION_MAX_LOOPS:-0}"                      # Reset session after N loops (0 = disabled)
 CLAUDE_CONTINUATION_EFFORT="${CLAUDE_CONTINUATION_EFFORT:-}"     # Effort level for loop 2+ (empty = same as CLAUDE_EFFORT)
 CLAUDE_REPO_MAP="${CLAUDE_REPO_MAP:-false}"                      # Generate lightweight repo map for context
@@ -931,18 +931,11 @@ build_loop_context() {
         fi
     fi
 
-    # Add rolling work summary (richer context than single-loop summary)
-    local work_history
-    work_history=$(get_work_summary 2>/dev/null)
-    if [[ -n "$work_history" ]]; then
-        context+="Work history: ${work_history} "
-    else
-        # Fallback: use previous loop summary if no rolling summary exists yet
-        if [[ -f "$RESPONSE_ANALYSIS_FILE" ]]; then
-            local prev_summary=$(jq -r '.analysis.work_summary // ""' "$RESPONSE_ANALYSIS_FILE" 2>/dev/null | head -c 200)
-            if [[ -n "$prev_summary" && "$prev_summary" != "null" ]]; then
-                context+="Previous: ${prev_summary} "
-            fi
+    # Add previous loop summary (brief — the continuation prompt has full details)
+    if [[ -f "$RESPONSE_ANALYSIS_FILE" ]]; then
+        local prev_summary=$(jq -r '.analysis.work_summary // ""' "$RESPONSE_ANALYSIS_FILE" 2>/dev/null | head -c 200)
+        if [[ -n "$prev_summary" && "$prev_summary" != "null" ]]; then
+            context+="Previous: ${prev_summary} "
         fi
     fi
 
@@ -955,8 +948,8 @@ build_loop_context() {
         fi
     fi
 
-    # Limit total length to ~1500 chars (increased from 500 to accommodate work history)
-    echo "${context:0:1500}"
+    # Limit loop context to 500 chars (brief metadata — rich context is in the continuation prompt)
+    echo "${context:0:500}"
 }
 
 # =============================================================================
@@ -964,8 +957,9 @@ build_loop_context() {
 # =============================================================================
 
 # Feature 1: Rolling Work Summary
-# Append current loop's work summary to the rolling summary file
-# Keeps the file bounded to ~2000 chars (~500 tokens)
+# Append current loop's work summary to the rolling summary file.
+# With a 1M context window, we keep full history (capped at 10K chars ~2500 tokens)
+# and only truncate aggressively for the compaction handoff.
 update_work_summary() {
     local loop_count=${1:-0}
     local summary=""
@@ -985,22 +979,32 @@ update_work_summary() {
 
     mkdir -p "$RALPH_DIR"
 
-    # Append and truncate to 2000 chars (keep most recent entries)
+    # Append and keep last 10K chars (~2500 tokens) — use the context window
     if [[ -f "$WORK_SUMMARY_FILE" ]]; then
-        # Append new entry, then keep only the last 2000 chars
         echo "$entry" >> "$WORK_SUMMARY_FILE"
-        local content
-        content=$(tail -c 2000 "$WORK_SUMMARY_FILE")
-        echo "$content" > "$WORK_SUMMARY_FILE"
+        local size
+        size=$(wc -c < "$WORK_SUMMARY_FILE" | tr -d ' ')
+        if [[ "$size" -gt 10000 ]]; then
+            local content
+            content=$(tail -c 10000 "$WORK_SUMMARY_FILE")
+            echo "$content" > "$WORK_SUMMARY_FILE"
+        fi
     else
         echo "$entry" > "$WORK_SUMMARY_FILE"
     fi
 }
 
-# Get the rolling work summary content
+# Get the rolling work summary content (full for continuation, short for compaction)
 get_work_summary() {
     if [[ -f "$WORK_SUMMARY_FILE" ]]; then
-        cat "$WORK_SUMMARY_FILE" 2>/dev/null | tail -c 500
+        cat "$WORK_SUMMARY_FILE" 2>/dev/null
+    fi
+}
+
+# Get a compact version for session handoff after compaction
+get_work_summary_compact() {
+    if [[ -f "$WORK_SUMMARY_FILE" ]]; then
+        tail -c 2000 "$WORK_SUMMARY_FILE" 2>/dev/null
     fi
 }
 
@@ -1111,62 +1115,129 @@ compact_session() {
     log_status "INFO" "Session compacted after ${session_loop_count} loops, ${session_tokens} tokens. Starting fresh with work summary."
 }
 
-# Build a rich handoff prompt for the first loop of a new session after compaction
+# Build a rich handoff prompt for the first loop of a new session after compaction.
+# This is the critical bridge — when we hit 800K tokens and start fresh,
+# the new session needs enough context to continue without losing momentum.
 build_session_handoff_prompt() {
     local prompt=""
 
-    # Include rolling work summary
+    prompt+="## Session Handoff — Continuing from previous session\n"
+    prompt+="The previous session reached the token limit and was compacted. Here is everything you need to continue:\n\n"
+
+    # Full work history (compact version for handoff)
     local work_history
-    work_history=$(get_work_summary 2>/dev/null)
+    work_history=$(get_work_summary_compact 2>/dev/null)
     if [[ -n "$work_history" ]]; then
         prompt+="## Work Completed So Far\n${work_history}\n\n"
     fi
 
-    # Include fix_plan status
+    # Full fix_plan status with both completed and remaining items
     if [[ -f "$RALPH_DIR/fix_plan.md" ]]; then
         local incomplete
         incomplete=$(grep -cE "^[[:space:]]*- \[ \]" "$RALPH_DIR/fix_plan.md" 2>/dev/null || echo "0")
         local completed
         completed=$(grep -cE "^[[:space:]]*- \[x\]" "$RALPH_DIR/fix_plan.md" 2>/dev/null || echo "0")
         prompt+="## Fix Plan Status\nCompleted: ${completed}, Remaining: ${incomplete}\n\n"
+
+        # Include the remaining tasks
+        local active_items
+        active_items=$(generate_active_fix_plan 2>/dev/null)
+        if [[ -n "$active_items" ]]; then
+            prompt+="## Remaining Tasks\n${active_items}\n\n"
+        fi
     fi
 
-    # Include last recommendation
+    # Recent git history
+    if command -v git &>/dev/null && git rev-parse --git-dir &>/dev/null 2>&1; then
+        local recent_commits
+        recent_commits=$(git log --oneline -10 2>/dev/null)
+        if [[ -n "$recent_commits" ]]; then
+            prompt+="## Recent Git History\n\`\`\`\n${recent_commits}\n\`\`\`\n\n"
+        fi
+
+        # Current project files
+        local file_tree
+        file_tree=$(git ls-files 2>/dev/null | grep -v '^\.ralph/' | grep -v 'node_modules' | head -50)
+        if [[ -n "$file_tree" ]]; then
+            prompt+="## Current Project Files\n\`\`\`\n${file_tree}\n\`\`\`\n\n"
+        fi
+    fi
+
+    # Last recommendation
     if [[ -f "$RESPONSE_ANALYSIS_FILE" ]]; then
         local recommendation
         recommendation=$(jq -r '.analysis.work_summary // ""' "$RESPONSE_ANALYSIS_FILE" 2>/dev/null)
         if [[ -n "$recommendation" && "$recommendation" != "null" ]]; then
-            prompt+="## Last Loop Recommendation\n${recommendation}\n"
+            prompt+="## Last Loop Recommendation\n${recommendation}\n\n"
         fi
     fi
 
     echo -e "$prompt"
 }
 
-# Feature 4: Prompt Caching Optimization
-# Generate a short continuation prompt for loop 2+ (~200 tokens instead of ~3K)
+# Feature 4: Rich Continuation Prompt
+# Loop 2+: Don't re-send instructions (already in session history).
+# Instead, give Claude maximum useful context — git diff, test results,
+# active tasks, work history. Use the context window, don't waste it.
 generate_continuation_prompt() {
     local loop_count=$1
     local prompt=""
 
     prompt+="Continue working on the project. This is loop #${loop_count}.\n\n"
 
-    # Include active (incomplete) fix plan items directly (Feature 6)
+    # === WHAT CHANGED LAST LOOP (git diff) ===
+    if command -v git &>/dev/null && git rev-parse --git-dir &>/dev/null 2>&1; then
+        local last_sha=""
+        [[ -f "$RALPH_DIR/.loop_start_sha" ]] && last_sha=$(cat "$RALPH_DIR/.loop_start_sha" 2>/dev/null)
+        if [[ -n "$last_sha" ]]; then
+            local diff_stat
+            diff_stat=$(git diff --stat "$last_sha" HEAD 2>/dev/null | tail -20)
+            if [[ -n "$diff_stat" ]]; then
+                prompt+="## Changes Made Last Loop\n\`\`\`\n${diff_stat}\n\`\`\`\n\n"
+            fi
+        fi
+
+        # Recent commits (last 3)
+        local recent_commits
+        recent_commits=$(git log --oneline -3 2>/dev/null)
+        if [[ -n "$recent_commits" ]]; then
+            prompt+="## Recent Commits\n\`\`\`\n${recent_commits}\n\`\`\`\n\n"
+        fi
+    fi
+
+    # === TEST RESULTS (if last loop ran tests) ===
+    if [[ -f "$RALPH_DIR/.last_test_output" ]]; then
+        local test_output
+        test_output=$(tail -20 "$RALPH_DIR/.last_test_output" 2>/dev/null)
+        if [[ -n "$test_output" ]]; then
+            prompt+="## Last Test Results\n\`\`\`\n${test_output}\n\`\`\`\n\n"
+        fi
+    fi
+
+    # === ACTIVE TASKS (only incomplete items from fix_plan) ===
     local active_items
     active_items=$(generate_active_fix_plan 2>/dev/null)
     if [[ -n "$active_items" ]]; then
         prompt+="## Remaining Tasks\n${active_items}\n\n"
     fi
 
-    # Include work summary
-    local work_history
-    work_history=$(get_work_summary 2>/dev/null)
-    if [[ -n "$work_history" ]]; then
-        prompt+="## Recent Work\n${work_history}\n\n"
+    # === FULL WORK HISTORY (not truncated — use the context window) ===
+    if [[ -f "$WORK_SUMMARY_FILE" ]]; then
+        local work_history
+        work_history=$(cat "$WORK_SUMMARY_FILE" 2>/dev/null)
+        if [[ -n "$work_history" ]]; then
+            prompt+="## Work History (all loops)\n${work_history}\n\n"
+        fi
     fi
 
-    # Include corrective guidance if previous loop asked questions
+    # === ERRORS FROM LAST LOOP ===
     if [[ -f "$RESPONSE_ANALYSIS_FILE" ]]; then
+        local is_stuck
+        is_stuck=$(jq -r '.analysis.is_stuck // false' "$RESPONSE_ANALYSIS_FILE" 2>/dev/null || echo "false")
+        if [[ "$is_stuck" == "true" ]]; then
+            prompt+="WARNING: You appear stuck on the same error. Try a completely different approach.\n\n"
+        fi
+
         local prev_asking_questions
         prev_asking_questions=$(jq -r '.analysis.asking_questions // false' "$RESPONSE_ANALYSIS_FILE" 2>/dev/null || echo "false")
         if [[ "$prev_asking_questions" == "true" ]]; then
@@ -1174,7 +1245,16 @@ generate_continuation_prompt() {
         fi
     fi
 
-    prompt+="Follow .ralph/fix_plan.md and choose the most important remaining item to implement. Remember to include the RALPH_STATUS block at the end of your response."
+    # === PROJECT FILE OVERVIEW (what exists now) ===
+    if command -v git &>/dev/null && git rev-parse --git-dir &>/dev/null 2>&1; then
+        local file_tree
+        file_tree=$(git ls-files 2>/dev/null | grep -v '^\.ralph/' | grep -v 'node_modules' | head -40)
+        if [[ -n "$file_tree" ]]; then
+            prompt+="## Current Project Files\n\`\`\`\n${file_tree}\n\`\`\`\n\n"
+        fi
+    fi
+
+    prompt+="Pick the highest priority remaining task from fix_plan.md and implement it. Include the RALPH_STATUS block at the end of your response."
 
     echo -e "$prompt"
 }

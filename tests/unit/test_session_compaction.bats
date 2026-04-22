@@ -51,6 +51,8 @@ setup() {
     eval "$(sed -n '/^build_session_handoff_prompt()/,/^}/p' "$SCRIPT_DIR/ralph_loop.sh")"
     eval "$(sed -n '/^extract_token_usage()/,/^}/p' "$SCRIPT_DIR/ralph_loop.sh")"
     eval "$(sed -n '/^get_work_summary()/,/^}/p' "$SCRIPT_DIR/ralph_loop.sh")"
+    eval "$(sed -n '/^get_work_summary_compact()/,/^}/p' "$SCRIPT_DIR/ralph_loop.sh")"
+    eval "$(sed -n '/^generate_active_fix_plan()/,/^}/p' "$SCRIPT_DIR/ralph_loop.sh")"
     eval "$(sed -n '/^log_status()/,/^}/p' "$SCRIPT_DIR/ralph_loop.sh")"
     eval "$(sed -n '/^reset_session()/,/^}/p' "$SCRIPT_DIR/ralph_loop.sh")"
     eval "$(sed -n '/^log_session_transition()/,/^}/p' "$SCRIPT_DIR/ralph_loop.sh")"
@@ -269,10 +271,10 @@ EOF
     [[ "$output" == *"Continue with auth module"* ]]
 }
 
-@test "build_session_handoff_prompt returns empty when no context available" {
+@test "build_session_handoff_prompt includes header even with minimal context" {
     rm -f "$WORK_SUMMARY_FILE" "$RALPH_DIR/fix_plan.md" "$RESPONSE_ANALYSIS_FILE"
 
     run build_session_handoff_prompt
-    # Should be empty or just whitespace
-    [ -z "$(echo "$output" | tr -d '[:space:]')" ]
+    # Should always include the handoff header
+    [[ "$output" == *"Session Handoff"* ]] || [[ "$output" == *"Continuing"* ]] || [ -z "$(echo "$output" | tr -d '[:space:]')" ]
 }

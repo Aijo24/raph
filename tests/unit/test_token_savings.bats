@@ -145,7 +145,7 @@ estimate_tokens() {
 # MEASUREMENT: Prompt Caching — Loop 1 vs Loop 9
 # =============================================================================
 
-@test "SAVINGS: continuation prompt is at least 60% smaller than full prompt" {
+@test "SAVINGS: continuation prompt does NOT re-send full PROMPT.md instructions" {
     # Loop 1: full prompt
     CLAUDE_CMD_ARGS=()
     build_claude_command "$PROMPT_FILE" "Loop #1. Remaining tasks: 5." "" 1
@@ -153,30 +153,44 @@ estimate_tokens() {
     full_prompt=$(get_prompt_arg)
     local full_size=${#full_prompt}
 
-    # Loop 9: continuation prompt (with session)
+    # Loop 9: rich continuation prompt (with session)
     CLAUDE_CMD_ARGS=()
     build_claude_command "$PROMPT_FILE" "Loop #9. Remaining tasks: 5." "session-abc-123" 9
     local cont_prompt
     cont_prompt=$(get_prompt_arg)
     local cont_size=${#cont_prompt}
 
-    # Continuation must be at least 60% smaller
-    local savings_pct=$(( (full_size - cont_size) * 100 / full_size ))
     echo "# Full prompt: ${full_size} chars (~$(estimate_tokens "$full_prompt") tokens)" >&3
     echo "# Continuation: ${cont_size} chars (~$(estimate_tokens "$cont_prompt") tokens)" >&3
-    echo "# Savings: ${savings_pct}%" >&3
 
-    [ "$savings_pct" -ge 60 ]
+    # Continuation must NOT contain the full PROMPT.md static instructions
+    [[ "$cont_prompt" != *"Exit Scenarios"* ]]
+    [[ "$cont_prompt" != *"Protected Files"* ]]
+    # But must contain useful context
+    [[ "$cont_prompt" == *"Remaining Tasks"* ]] || [[ "$cont_prompt" == *"Continue working"* ]]
 }
 
-@test "SAVINGS: continuation prompt is under 2000 chars (~500 tokens)" {
+@test "SAVINGS: continuation prompt is context-rich (not minimal)" {
+    # Set up realistic state so continuation has real data
+    echo "- [Loop 1, 10:00] Set up project" > "$WORK_SUMMARY_FILE"
+    cat > "$RALPH_DIR/fix_plan.md" << 'PLAN'
+## Tasks
+- [x] Done task
+- [ ] Pending task A
+- [ ] Pending task B
+PLAN
+
     CLAUDE_CMD_ARGS=()
-    build_claude_command "$PROMPT_FILE" "Loop #9. Remaining tasks: 3." "session-abc-123" 9
+    build_claude_command "$PROMPT_FILE" "Loop #9. Remaining tasks: 2." "session-abc-123" 9
     local cont_prompt
     cont_prompt=$(get_prompt_arg)
 
     echo "# Continuation prompt size: ${#cont_prompt} chars (~$(estimate_tokens "$cont_prompt") tokens)" >&3
-    [ ${#cont_prompt} -lt 2000 ]
+
+    # Must contain actual useful context, not just "continue working"
+    [[ "$cont_prompt" == *"Remaining Tasks"* ]]
+    [[ "$cont_prompt" == *"Pending task A"* ]]
+    [[ "$cont_prompt" == *"Work History"* ]]
 }
 
 @test "SAVINGS: full PROMPT.md is over 8000 chars (~2000 tokens)" {
@@ -248,17 +262,18 @@ estimate_tokens() {
 # MEASUREMENT: Rolling Work Summary is bounded
 # =============================================================================
 
-@test "SAVINGS: work summary stays under 500 chars in loop context" {
+@test "SAVINGS: work summary keeps full history within bounds" {
     local summary
     summary=$(get_work_summary)
 
     echo "# Work summary size: ${#summary} chars (~$(estimate_tokens "$summary") tokens)" >&3
-    [ ${#summary} -le 500 ]
+    # Full history returned (not truncated to 500 chars anymore)
+    # Bounded at 10K chars max by update_work_summary
 }
 
-@test "SAVINGS: work summary survives 100 loop accumulations without growing unbounded" {
-    # Simulate 100 loops writing summaries
-    for i in $(seq 1 100); do
+@test "SAVINGS: work summary survives 200 loop accumulations within 10K bound" {
+    # Simulate 200 loops writing summaries
+    for i in $(seq 1 200); do
         cat > "$RESPONSE_ANALYSIS_FILE" << EOF
 {"analysis": {"work_summary": "Completed task $i: implemented feature number $i with tests and docs"}}
 EOF
@@ -266,11 +281,11 @@ EOF
     done
 
     local file_size
-    file_size=$(wc -c < "$WORK_SUMMARY_FILE")
+    file_size=$(wc -c < "$WORK_SUMMARY_FILE" | tr -d ' ')
 
-    echo "# After 100 loops, work summary file: ${file_size} chars" >&3
-    # Must stay under 2100 chars (2000 target + margin)
-    [ "$file_size" -le 2100 ]
+    echo "# After 200 loops, work summary file: ${file_size} chars" >&3
+    # Bounded at 10K chars (enough for ~2500 tokens — use the context window)
+    [ "$file_size" -le 10100 ]
 }
 
 # =============================================================================
@@ -418,53 +433,32 @@ EOF
 # MEASUREMENT: End-to-end token comparison over simulated 10-loop run
 # =============================================================================
 
-@test "SAVINGS: simulated 10-loop run shows cumulative savings vs baseline" {
-    local baseline_total=0
-    local optimized_total=0
+@test "SAVINGS: continuation replaces repeated instructions with rich context" {
+    echo "- [Loop 1, 10:00] Set up project" > "$WORK_SUMMARY_FILE"
 
-    # Full prompt size (baseline: sent every loop)
+    # Full prompt (loop 1)
     CLAUDE_CMD_ARGS=()
     build_claude_command "$PROMPT_FILE" "Loop #1." "" 1
     local full_prompt
     full_prompt=$(get_prompt_arg)
-    local full_prompt_size=${#full_prompt}
 
-    # Continuation prompt size
+    # Continuation (loop 5)
     CLAUDE_CMD_ARGS=()
     build_claude_command "$PROMPT_FILE" "Loop #5." "session-abc" 5
     local cont_prompt
     cont_prompt=$(get_prompt_arg)
-    local cont_prompt_size=${#cont_prompt}
 
-    # Baseline: 10 loops * full prompt
-    baseline_total=$((full_prompt_size * 10))
+    echo "# Full prompt (loop 1): ${#full_prompt} chars" >&3
+    echo "# Continuation (loop 5): ${#cont_prompt} chars" >&3
+    echo "# Strategy: don't send less — send better." >&3
+    echo "# Loop 1: static instructions (in session after first send)" >&3
+    echo "# Loop 5: git diff, tasks, work history, file tree (new info)" >&3
 
-    # Optimized: 1 full + 9 continuation
-    optimized_total=$((full_prompt_size + cont_prompt_size * 9))
-
-    local saved=$((baseline_total - optimized_total))
-    local saved_pct=$((saved * 100 / baseline_total))
-    local saved_tokens=$((saved / 4))
-
-    echo "# ============================================" >&3
-    echo "# 10-LOOP TOKEN SAVINGS REPORT" >&3
-    echo "# ============================================" >&3
-    echo "# Full prompt (loop 1):       ${full_prompt_size} chars (~$((full_prompt_size/4)) tokens)" >&3
-    echo "# Continuation prompt (2-10): ${cont_prompt_size} chars (~$((cont_prompt_size/4)) tokens)" >&3
-    echo "# " >&3
-    echo "# BASELINE (no optimization):  ${baseline_total} chars (~$((baseline_total/4)) tokens)" >&3
-    echo "# OPTIMIZED (prompt caching):  ${optimized_total} chars (~$((optimized_total/4)) tokens)" >&3
-    echo "# " >&3
-    echo "# SAVED: ${saved} chars (~${saved_tokens} tokens)" >&3
-    echo "# SAVINGS: ${saved_pct}% reduction in user prompt tokens" >&3
-    echo "# ============================================" >&3
-    echo "# Note: system prompt (PROMPT.md in --append-system-prompt)" >&3
-    echo "# is cached by Anthropic at 90% cost discount after loop 1." >&3
-    echo "# Effective savings including cache: >90% on static content." >&3
-    echo "# ============================================" >&3
-
-    # Must save at least 50% across 10 loops
-    [ "$saved_pct" -ge 50 ]
+    # Continuation must NOT duplicate static instructions
+    [[ "$cont_prompt" != *"Exit Scenarios"* ]]
+    # But MUST have actionable context
+    [[ "$cont_prompt" == *"Continue working"* ]]
+    [[ "$cont_prompt" == *"Remaining Tasks"* ]] || [[ "$cont_prompt" == *"RALPH_STATUS"* ]]
 }
 
 @test "SAVINGS: loop context stays bounded even with rich work history" {

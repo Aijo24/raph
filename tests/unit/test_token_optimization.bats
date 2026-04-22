@@ -122,10 +122,10 @@ EOF
     grep -q "Added tests" "$WORK_SUMMARY_FILE"
 }
 
-@test "update_work_summary truncates to 2000 chars" {
-    # Create a large existing summary (> 2000 chars)
+@test "update_work_summary truncates to 10000 chars" {
+    # Create a large existing summary (> 10000 chars)
     local large_content=""
-    for i in $(seq 1 100); do
+    for i in $(seq 1 500); do
         large_content+="- [Loop $i, 10:00] Some work was done here for task number $i\n"
     done
     echo -e "$large_content" > "$WORK_SUMMARY_FILE"
@@ -134,9 +134,9 @@ EOF
 {"analysis": {"work_summary": "Latest work"}}
 EOF
 
-    update_work_summary 101
-    local size=$(wc -c < "$WORK_SUMMARY_FILE")
-    [ "$size" -le 2100 ]  # Allow small margin for newlines
+    update_work_summary 501
+    local size=$(wc -c < "$WORK_SUMMARY_FILE" | tr -d ' ')
+    [ "$size" -le 10100 ]  # Allow small margin for newlines
 }
 
 @test "update_work_summary skips when no summary available" {
@@ -153,7 +153,7 @@ EOF
     [ "$output" = "" ]
 }
 
-@test "get_work_summary returns content truncated to 500 chars" {
+@test "get_work_summary returns full content" {
     local content=""
     for i in $(seq 1 50); do
         content+="- [Loop $i, 10:00] Task done\n"
@@ -161,7 +161,9 @@ EOF
     echo -e "$content" > "$WORK_SUMMARY_FILE"
 
     run get_work_summary
-    [ ${#output} -le 500 ]
+    # Full content returned (not truncated)
+    [[ "$output" == *"Loop 1"* ]]
+    [[ "$output" == *"Loop 50"* ]]
 }
 
 # =============================================================================
@@ -188,11 +190,12 @@ EOF
     [[ "$output" != *"Completed task 1"* ]]
 }
 
-@test "generate_continuation_prompt includes work summary" {
+@test "generate_continuation_prompt includes full work history" {
     echo "- [Loop 1, 10:00] Implemented auth" > "$WORK_SUMMARY_FILE"
 
     run generate_continuation_prompt 2
     [[ "$output" == *"Implemented auth"* ]]
+    [[ "$output" == *"Work History"* ]]
 }
 
 @test "generate_continuation_prompt includes question guidance when needed" {
