@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository Overview
 
-This is the Ralph for Claude Code repository - an autonomous AI development loop system that enables continuous development cycles with intelligent exit detection and rate limiting.
+This is the Raph repository — a token-optimized fork of Ralph for Claude Code. Raph is an autonomous AI development loop system that enables continuous development cycles with intelligent exit detection, rate limiting, smart context management, and multi-task planning.
+
+**Key philosophy: don't send less, send better.** Replace wasted repeated instructions with useful context (git diff, test results, file tree). Use the 1M context window aggressively (800K compaction threshold). Batch 2-4 related tasks per loop.
 
 See [README.md](README.md) for version info, changelog, and user documentation.
 
@@ -166,9 +168,9 @@ ralph --auto-reset-circuit   # Auto-reset OPEN state on startup
 ralph --reset-session    # Reset session state manually
 
 # Token optimization
-ralph --no-prompt-caching        # Disable continuation prompt (send full prompt every loop)
+ralph --no-prompt-caching        # Disable smart context (send full prompt every loop)
 ralph --session-max-loops 10     # Reset session every 10 loops (observation masking)
-ralph --compact-threshold 100000 # Reset session after 100K cumulative tokens
+ralph --compact-threshold 500000 # Reset session after 500K cumulative tokens (default: 800K)
 ralph --repo-map                 # Enable lightweight repo map for context
 
 # Backup and rollback (requires git; Issue #23)
@@ -280,7 +282,11 @@ ENABLE_BACKUP=false                   # Automatic git backup branches (Issue #23
 **Loop Context:**
 Each loop iteration injects context via `build_loop_context()`:
 - Current loop number
+- Git diff of changes from previous loop
+- Test results (pass/fail counts, specific failures)
+- File tree snapshot
 - Remaining tasks from fix_plan.md
+- Task grouping suggestions from `suggest_task_groups()`
 - Circuit breaker state (if not CLOSED)
 - Previous loop work summary
 - Corrective guidance if previous loop detected questions (Issue #190)
@@ -290,21 +296,35 @@ Each loop iteration injects context via `build_loop_context()`:
 - Use `--continue` flag to maintain context across loops
 - Disable with `--no-continue` for isolated iterations
 
-### Token Optimization
+### Token Optimization (Smart Context Management)
 
-Ralph implements multiple strategies to reduce token consumption across loop iterations:
+Raph implements a "send better, not less" strategy for token optimization. Instead of just reducing tokens, it replaces wasted repeated instructions with useful context and uses the 1M context window aggressively.
 
-**Prompt Caching (default: enabled)**
+**Smart Context Management (default: enabled)**
 - Loop 1: Sends full PROMPT.md via `-p` (establishes instructions)
-- Loop 2+: Moves static PROMPT.md to `--append-system-prompt` (Anthropic caches system prompt prefix at 90% discount) and sends a short continuation prompt (~200 tokens vs ~3K) via `-p`
-- Continuation prompt includes: active fix_plan items, rolling work summary, corrective guidance
+- Loop 2+: Stops re-sending instructions (already in session). Instead sends rich context via `-p`:
+  - Git diff of changes from the previous loop
+  - Test results (pass/fail counts, specific failures)
+  - File tree snapshot
+  - Active fix_plan items (only uncompleted tasks)
+  - Task grouping suggestions from `suggest_task_groups()`
+  - Rolling work summary
+  - Corrective guidance if the previous loop asked questions
+- Static PROMPT.md moves to `--append-system-prompt` (Anthropic caches at 90% discount)
 - Disable with `--no-prompt-caching` or `PROMPT_CACHING=false` in `.ralphrc`
 
-**Session Compaction**
+**Session Compaction at 800K**
 - Tracks cumulative session tokens in `.ralph/.session_tokens`
-- Resets session when tokens exceed `SESSION_COMPACT_THRESHOLD` (default: 200000) or loops exceed `SESSION_MAX_LOOPS` (default: 0 = disabled)
-- On compaction: session is reset, work summary is preserved for continuity, handoff context is generated
+- Uses the 1M context window aggressively: compacts at 800K tokens (not 200K)
+- Resets session when tokens exceed `SESSION_COMPACT_THRESHOLD` (default: 800000) or loops exceed `SESSION_MAX_LOOPS` (default: 0 = disabled)
+- On compaction: session is reset with thorough handoff (work history, git log, remaining tasks, file tree)
 - Session tokens displayed in `ralph-monitor` dashboard and `status.json`
+
+**Multi-Task Planning**
+- `suggest_task_groups()` analyzes `fix_plan.md` and identifies related tasks under the same section
+- Continuation prompts include suggested task batches (2-4 related tasks)
+- Claude decides whether to accept the grouping or work individually
+- Reduces context switching and loop count for related work
 
 **Rolling Work Summary**
 - `.ralph/.work_summary` accumulates timestamped bullet points of work done across loops
@@ -330,12 +350,21 @@ Ralph implements multiple strategies to reduce token consumption across loop ite
 
 **Token Optimization Configuration Variables:**
 ```bash
-CLAUDE_PROMPT_CACHING="${CLAUDE_PROMPT_CACHING:-true}"           # Continuation prompts on loop 2+
-SESSION_COMPACT_THRESHOLD="${SESSION_COMPACT_THRESHOLD:-200000}" # Reset session after N tokens
-SESSION_MAX_LOOPS="${SESSION_MAX_LOOPS:-0}"                      # Reset session after N loops (0=disabled)
-CLAUDE_CONTINUATION_EFFORT="${CLAUDE_CONTINUATION_EFFORT:-}"     # Effort for loop 2+ (empty=same)
-CLAUDE_REPO_MAP="${CLAUDE_REPO_MAP:-false}"                      # Lightweight repo map
-CLAUDE_REPO_MAP_MAX_TOKENS="${CLAUDE_REPO_MAP_MAX_TOKENS:-1500}" # Max chars for repo map
+CLAUDE_PROMPT_CACHING="${CLAUDE_PROMPT_CACHING:-true}"            # Smart context on loop 2+ (don't re-send instructions)
+SESSION_COMPACT_THRESHOLD="${SESSION_COMPACT_THRESHOLD:-800000}"  # Reset session after 800K tokens (uses 1M window aggressively)
+SESSION_MAX_LOOPS="${SESSION_MAX_LOOPS:-0}"                       # Reset session after N loops (0=disabled)
+CLAUDE_CONTINUATION_EFFORT="${CLAUDE_CONTINUATION_EFFORT:-}"      # Effort for loop 2+ (empty=same)
+CLAUDE_REPO_MAP="${CLAUDE_REPO_MAP:-false}"                       # Lightweight repo map
+CLAUDE_REPO_MAP_MAX_TOKENS="${CLAUDE_REPO_MAP_MAX_TOKENS:-1500}"  # Max chars for repo map
+```
+
+**Token Savings Tracker (raph-track):**
+```bash
+raph-track              # Summary of token savings for current project
+raph-track --live       # Real-time token tracking during a loop
+raph-track --watch      # Continuous monitoring (refreshes every 5s)
+raph-track --compare    # Side-by-side comparison: Raph vs baseline Ralph
+raph-track --json       # Machine-readable output for pipelines
 ```
 
 ### Intelligent Exit Detection
@@ -427,7 +456,7 @@ Templates in `templates/` provide starting points for new projects:
 ## Global Installation
 
 Ralph installs to:
-- **Commands**: `~/.local/bin/` (ralph, ralph-monitor, ralph-setup, ralph-import, ralph-migrate, ralph-enable, ralph-enable-ci, ralph-stats)
+- **Commands**: `~/.local/bin/` (ralph, ralph-monitor, ralph-setup, ralph-import, ralph-migrate, ralph-enable, ralph-enable-ci, ralph-stats, raph-track)
 - **Templates**: `~/.ralph/templates/`
 - **Scripts**: `~/.ralph/` (ralph_loop.sh, ralph_monitor.sh, setup.sh, ralph_import.sh, migrate_to_ralph_folder.sh, ralph_enable.sh, ralph_enable_ci.sh, ralph-stats.sh)
 - **Libraries**: `~/.ralph/lib/` (circuit_breaker.sh, response_analyzer.sh, date_utils.sh, timeout_utils.sh, enable_core.sh, wizard_utils.sh, task_sources.sh, file_protection.sh)
@@ -441,6 +470,7 @@ After installation, the following global commands are available:
 - `ralph-enable` - Interactive wizard to enable Ralph in existing projects
 - `ralph-enable-ci` - Non-interactive version for CI/automation
 - `ralph-stats` - Show metrics summary for loop execution analytics
+- `raph-track` - Token savings tracker (--live, --watch, --compare, --json modes)
 
 ## Integration Points
 

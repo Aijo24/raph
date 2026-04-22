@@ -1,4 +1,4 @@
-# Ralph CLI Options Reference
+# Raph CLI Options Reference
 
 Complete reference for all `ralph` command-line flags and `.ralphrc` configuration patterns.
 
@@ -139,16 +139,16 @@ ralph --session-max-loops 5    # Aggressive masking for token-sensitive work
 ---
 
 ### `--compact-threshold N`
-Reset the session after N cumulative tokens. Prevents unbounded session growth.
+Reset the session after N cumulative tokens. Uses the 1M context window aggressively by default.
 
 ```bash
-ralph --compact-threshold 100000   # Compact sooner (cost-sensitive)
-ralph --compact-threshold 500000   # Compact later (context-sensitive)
+ralph --compact-threshold 500000   # Compact sooner (cost-sensitive)
+ralph --compact-threshold 900000   # Compact later (maximum context retention)
 ```
 
 | Default | `.ralphrc` key |
 |---------|----------------|
-| `200000` | `SESSION_COMPACT_THRESHOLD` |
+| `800000` | `SESSION_COMPACT_THRESHOLD` |
 
 ---
 
