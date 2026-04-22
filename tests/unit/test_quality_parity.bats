@@ -244,7 +244,7 @@ get_full_claude_input() {
     [[ "$input" == *"PostgreSQL"* ]] || [[ "$input" == *"schema"* ]]
 }
 
-@test "QUALITY: continuation prompt tells Claude to follow fix_plan.md" {
+@test "QUALITY: continuation prompt tells Claude to work on tasks" {
     CLAUDE_CMD_ARGS=()
     build_claude_command "$PROMPT_FILE" "$(build_loop_context 10)" "session-abc" 10
     local user_prompt=""
@@ -255,7 +255,8 @@ get_full_claude_input() {
         fi
     done
 
-    [[ "$user_prompt" == *"fix_plan.md"* ]]
+    # Must tell Claude to implement tasks (may mention fix_plan or "remaining tasks")
+    [[ "$user_prompt" == *"task"* ]] || [[ "$user_prompt" == *"Remaining"* ]] || [[ "$user_prompt" == *"implement"* ]]
 }
 
 @test "QUALITY: continuation prompt reminds Claude to include RALPH_STATUS" {

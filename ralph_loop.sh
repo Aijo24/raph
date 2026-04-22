@@ -1221,6 +1221,13 @@ generate_continuation_prompt() {
         prompt+="## Remaining Tasks\n${active_items}\n\n"
     fi
 
+    # === SUGGESTED TASK GROUPING ===
+    local groups
+    groups=$(suggest_task_groups 2>/dev/null)
+    if [[ -n "$groups" ]]; then
+        prompt+="## Task Grouping Suggestions\n${groups}\n\n"
+    fi
+
     # === FULL WORK HISTORY (not truncated — use the context window) ===
     if [[ -f "$WORK_SUMMARY_FILE" ]]; then
         local work_history
@@ -1254,7 +1261,7 @@ generate_continuation_prompt() {
         fi
     fi
 
-    prompt+="Pick the highest priority remaining task from fix_plan.md and implement it. Include the RALPH_STATUS block at the end of your response."
+    prompt+="Review the remaining tasks, group related ones, and implement 2-4 tasks this loop. Commit after each logical unit. Include the RALPH_STATUS block at the end of your response."
 
     echo -e "$prompt"
 }
@@ -1289,7 +1296,55 @@ generate_active_fix_plan() {
 
     # Keep section headers (## lines) and uncompleted items (- [ ])
     # Filter out completed items (- [x])
-    grep -E "^(#|[[:space:]]*- \[ \])" "$RALPH_DIR/fix_plan.md" 2>/dev/null | head -30
+    grep -E "^(#|[[:space:]]*- \[ \])" "$RALPH_DIR/fix_plan.md" 2>/dev/null | head -50
+}
+
+# Suggest task grouping — identify related tasks that should be done together
+suggest_task_groups() {
+    if [[ ! -f "$RALPH_DIR/fix_plan.md" ]]; then
+        return 0
+    fi
+
+    local tasks
+    tasks=$(grep -E "^[[:space:]]*- \[ \]" "$RALPH_DIR/fix_plan.md" 2>/dev/null)
+    [[ -z "$tasks" ]] && return 0
+
+    local task_count
+    task_count=$(echo "$tasks" | wc -l | tr -d ' ')
+
+    # If 3 or fewer tasks remain, just do them all
+    if [[ "$task_count" -le 3 ]]; then
+        echo "Only ${task_count} tasks remaining — complete them all this loop."
+        return 0
+    fi
+
+    # Group tasks under the same section header
+    local current_section=""
+    local group=""
+    local group_count=0
+
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^##\  ]]; then
+            # New section — output previous group if it had tasks
+            if [[ $group_count -ge 2 && -n "$group" ]]; then
+                echo "Suggested batch (${group_count} related tasks under '${current_section}'):"
+                echo "$group"
+                echo ""
+            fi
+            current_section=$(echo "$line" | sed 's/^## //')
+            group=""
+            group_count=0
+        elif [[ "$line" =~ ^[[:space:]]*-\ \[\ \] ]]; then
+            group+="  $line"$'\n'
+            group_count=$((group_count + 1))
+        fi
+    done < "$RALPH_DIR/fix_plan.md"
+
+    # Output last group
+    if [[ $group_count -ge 2 && -n "$group" ]]; then
+        echo "Suggested batch (${group_count} related tasks under '${current_section}'):"
+        echo "$group"
+    fi
 }
 
 # Feature 8: Lightweight Repo Map
